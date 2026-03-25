@@ -1,114 +1,110 @@
-import os
-import sys
-import time
-from threading import Thread
+import argparse
 
-import lib.videoDownload as videoDownload
 import lib.chromeCatch as chromeCatch
+import lib.videoDownload as videoDownload
 
-# 抓取优酷视频
-
-videoGroupName = '平凡的荣耀'
-videoHomeUrl = 'https://v.youku.com/v_show/id_XNDgzNDM2NTM1Ng==.html'
+DEFAULT_VIDEO_GROUP_NAME = 'youku-download'
 
 
-def start():
+def parse_args():
+    parser = argparse.ArgumentParser(description='优酷视频下载工具')
+    parser.add_argument(
+        'arg1',
+        nargs='?',
+        help='视频链接，或旧版调用方式里的下载目录名称',
+    )
+    parser.add_argument(
+        'arg2',
+        nargs='?',
+        help='旧版调用方式里的优酷视频页或合集页地址',
+    )
+    parser.add_argument(
+        '--group',
+        dest='video_group_name',
+        default='',
+        help='下载目录名称，默认使用 youku-download',
+    )
+    return parser.parse_args()
+
+
+def resolve_cli_args(args):
+    if args.arg2:
+        videoGroupName = args.video_group_name or args.arg1 or DEFAULT_VIDEO_GROUP_NAME
+        videoHomeUrl = args.arg2
+        return videoGroupName, videoHomeUrl
+
+    if args.arg1:
+        videoGroupName = args.video_group_name or DEFAULT_VIDEO_GROUP_NAME
+        videoHomeUrl = args.arg1
+        return videoGroupName, videoHomeUrl
+
+    raise SystemExit('请提供优酷视频页或合集页地址。示例：python3 main.py --group 验证 "https://v.youku.com/v_show/..."')
+
+
+def start(videoGroupName, videoHomeUrl):
     videoHelper = videoDownload.VideoDownload(videoGroupName, videoHomeUrl)
+    records = videoHelper.syncVideoCsv()
+    print('任务列表已准备，共 {0} 条视频。'.format(len(records)))
 
-    # 如果不存在文件，则初始化csv文件
-    if not os.path.exists(videoHelper.getCsvFile()):
-        videoHelper.initVideoCsv()
-        print('初始化csv文件 {0} 完成'.format(videoHelper.getCsvFile()))
-
-    # 下载m3u8 和 ass 文件
-    def downloadM3u8():
+    try:
         while True:
-            curVideoItem = videoHelper.getUnDownLoadM3u8Item()
-            if len(curVideoItem) == 0:
+            record = videoHelper.getPendingCaptureRecord()
+            if record is None:
                 break
 
+            print('开始处理第 {0} 条视频：{1}'.format(record.index, record.title))
             chromeHandler = chromeCatch.ChromeCatch(
-                curVideoItem[0], curVideoItem[1], curVideoItem[2], videoGroupName)
-
-            if chromeHandler.login():
-                time.sleep(3)
+                record.index,
+                record.title,
+                record.url,
+                videoGroupName,
+            )
+            videoHelper.markCaptureStarted(record)
 
             try:
+                chromeHandler.login()
                 chromeHandler.downloadVideoMidFile()
-                curVideoItem.append('m3u8')
-            except Exception as e:
-                curVideoItem.append('fail:' + str(e))
+            except Exception as error:
+                videoHelper.markCaptureFailed(record, error)
+                print('第 {0} 条视频清单抓取失败：{1}'.format(record.index, error))
+                continue
 
-            videoHelper.updateDownLoadItem(curVideoItem)
+            videoHelper.markCaptureSuccess(record)
+            print('第 {0} 条视频清单抓取完成。'.format(record.index))
 
+        while True:
+            record = videoHelper.getPendingConvertRecord()
+            if record is None:
+                break
+
+            print('开始输出 MP4：第 {0} 条视频 {1}'.format(record.index, record.title))
+            videoHelper.markConvertStarted(record)
+
+            try:
+                mp4Path = videoHelper.convertRecordToMp4(record)
+            except Exception as error:
+                videoHelper.markConvertFailed(record, error)
+                print('第 {0} 条视频 MP4 输出失败：{1}'.format(record.index, error))
+                continue
+
+            videoHelper.markConvertSuccess(record, mp4Path)
+            print('第 {0} 条视频 MP4 输出完成：{1}'.format(record.index, mp4Path))
+    finally:
         chromeCatch.ChromeCatch.close()
 
-    def downloadTs():
-        while True:
-            curVideoItem = videoHelper.getUnDownLoadTsItem()
-            if len(curVideoItem) == 0:
-                break
-
-            videoIndex = curVideoItem[0]
-            videoName = curVideoItem[1]
-
-            m3u8File = videoHelper.getFileM3u8Path(videoIndex, videoName)
-            tsFile = videoHelper.getFileTsPath(videoIndex, videoName)
-
-            try:
-                curVideoItem.append('downloading')
-                videoHelper.updateDownLoadItem(curVideoItem)
-
-                videoHelper.downloadTs(m3u8File, tsFile)
-                curVideoItem[4] = 'ts'
-            except Exception as e:
-                curVideoItem[4] = 'fail:' + str(e)
-
-            videoHelper.updateDownLoadItem(curVideoItem)
-
-    def convertTsToMp4():
-        while True:
-            curVideoItem = videoHelper.getUnConvertTsItem()
-            if len(curVideoItem) == 0:
-                break
-
-            try:
-                curVideoItem.append('converting')
-                videoHelper.updateDownLoadItem(curVideoItem)
-
-                videoHelper.convertTsToMp4(curVideoItem[0], curVideoItem[1])
-                curVideoItem[5] = 'mp4'
-            except Exception as e:
-                print(e)
-                curVideoItem[5] = 'fail:' + str(e)
-
-            videoHelper.updateDownLoadItem(curVideoItem)
-
-    downloadM3u8()
-
-    threadCount = 1
-
-    threads = []
-    for i in range(threadCount):
-        # TODO: 线程锁未加上，出现了数据竞争
-        threads.append(Thread(target=downloadTs))
-
-    for t in threads:
-        t.setDaemon(True)
-        t.start()
-    t.join()
-
-    convertTsToMp4()
+    summary = videoHelper.getSummary()
     print('======================finish=======================')
-    # downloadTs()
-    print('视频下载完毕')
+    print(
+        '共 {0} 条视频，清单完成 {1} 条，MP4 完成 {2} 条，失败 {3} 条。'.format(
+            summary['total'],
+            summary['captured'],
+            summary['converted'],
+            summary['failed'],
+        )
+    )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        videoGroupName = sys.argv[1]
-        videoHomeUrl = sys.argv[2]
-    else:
-        pass
-
-    start()
+    args = parse_args()
+    videoGroupName, videoHomeUrl = resolve_cli_args(args)
+    start(videoGroupName, videoHomeUrl)
