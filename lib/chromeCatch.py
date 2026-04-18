@@ -3,6 +3,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 from urllib.parse import urlparse
 
 import requests
@@ -12,11 +13,15 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 import lib.hls as hls
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DOWNLOAD_ROOT = Path('/Volumes/Lexar E300 Media/dance')
+DOWNLOAD_ROOT = Path(
+    os.getenv('YOUKU_DOWNLOAD_ROOT', str(DEFAULT_DOWNLOAD_ROOT))
+).expanduser()
 DEFAULT_USER_AGENT = (
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
 )
-CHROME_PROFILE_DIR = PROJECT_ROOT / 'download' / '.chrome-profile'
+CHROME_PROFILE_DIR = DOWNLOAD_ROOT / '.chrome-profile'
 LOGIN_URL = 'https://account.youku.com/'
 LOGIN_SUCCESS_URL_PREFIX = 'https://www.youku.com/ku/webhome'
 SCAN_LOGIN_TIMEOUT = int(os.getenv('YOUKU_SCAN_TIMEOUT', '180'))
@@ -24,6 +29,7 @@ PAGE_LOAD_TIMEOUT = int(os.getenv('YOUKU_PAGE_LOAD_TIMEOUT', '25'))
 CAPTURE_TIMEOUT = int(os.getenv('YOUKU_CAPTURE_TIMEOUT', '60'))
 MANUAL_PLAY_HINT_AFTER = int(os.getenv('YOUKU_MANUAL_PLAY_HINT_AFTER', '8'))
 CAPTURE_POLL_INTERVAL = float(os.getenv('YOUKU_CAPTURE_POLL_INTERVAL', '2'))
+CAPTURE_DEEP_FALLBACK_AFTER = int(os.getenv('YOUKU_CAPTURE_DEEP_FALLBACK_AFTER', '2'))
 RESPONSE_BODY_LIMIT = int(os.getenv('YOUKU_RESPONSE_BODY_LIMIT', '1500000'))
 MAX_RESPONSE_BODIES_PER_PASS = int(os.getenv('YOUKU_MAX_RESPONSE_BODIES_PER_PASS', '10'))
 MAX_PERFORMANCE_LOGS_PER_PASS = int(os.getenv('YOUKU_MAX_PERFORMANCE_LOGS_PER_PASS', '800'))
@@ -31,13 +37,18 @@ PAGE_TEXT_LIMIT = int(os.getenv('YOUKU_PAGE_TEXT_LIMIT', '1200000'))
 OPEN_URL_RETRY_COUNT = int(os.getenv('YOUKU_OPEN_URL_RETRY_COUNT', '3'))
 OPEN_URL_RETRY_DELAY = float(os.getenv('YOUKU_OPEN_URL_RETRY_DELAY', '2'))
 YOUKU_HOME_URL = 'https://www.youku.com/'
+SEARCH_SCROLL_PAUSE = float(os.getenv('YOUKU_SEARCH_SCROLL_PAUSE', '1.2'))
+SEARCH_SCROLL_MAX_ROUNDS = int(os.getenv('YOUKU_SEARCH_SCROLL_MAX_ROUNDS', '30'))
+SEARCH_SCROLL_STABLE_ROUNDS = int(os.getenv('YOUKU_SEARCH_SCROLL_STABLE_ROUNDS', '3'))
+SEARCH_RESULT_LIMIT = int(os.getenv('YOUKU_SEARCH_RESULT_LIMIT', '200'))
 
 singleBrowser = None
 isLogin = False
 
 
-def _build_browser():
-    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+def _build_browser(profile_dir=None):
+    profilePath = Path(profile_dir or CHROME_PROFILE_DIR)
+    profilePath.mkdir(parents=True, exist_ok=True)
 
     option = webdriver.ChromeOptions()
     option.add_argument('--log-level=3')
@@ -45,7 +56,7 @@ def _build_browser():
     option.add_argument('--disable-blink-features=AutomationControlled')
     option.add_argument('--disable-infobars')
     option.add_argument('--disable-quic')
-    option.add_argument(f'--user-data-dir={CHROME_PROFILE_DIR}')
+    option.add_argument(f'--user-data-dir={profilePath}')
     option.add_experimental_option('excludeSwitches', ['enable-automation'])
     option.add_experimental_option('useAutomationExtension', False)
     option.page_load_strategy = 'eager'
@@ -218,6 +229,20 @@ class ChromeCatch:
         singleBrowser = None
         isLogin = False
 
+    @classmethod
+    def collect_search_results(cls, searchUrl):
+        helper = cls(0, 'search', searchUrl, 'search')
+        browser = _ensure_browser()
+
+        print('检测到搜索页，正在打开并滚动提取视频链接。')
+        helper.__open_url(browser, searchUrl, '搜索页')
+        results = helper.__collect_search_results(browser, searchUrl)
+        if not results:
+            raise RuntimeError('搜索页未识别到任何可下载的视频链接。')
+
+        print('搜索页解析完成，共识别 {0} 条视频链接。'.format(len(results)))
+        return results
+
     def __wait_for_login_redirect(self, browser, timeout):
         startedAt = time.time()
         while time.time() - startedAt < timeout:
@@ -252,9 +277,21 @@ class ChromeCatch:
             self.__try_start_playback(browser)
             time.sleep(1.2)
 
-            self.__consume_performance_entries(browser, mediaState, trackedResponses, seenUrls)
+            allowDeepFallback = len(mediaState['m3u8']) == 0 and roundIndex >= CAPTURE_DEEP_FALLBACK_AFTER
+
+            self.__consume_performance_entries(
+                browser,
+                mediaState,
+                trackedResponses,
+                seenUrls,
+                allowResponseBody=allowDeepFallback,
+            )
             self.__consume_resource_entries(browser, mediaState, seenUrls)
-            self.__consume_page_text(browser, mediaState, seenUrls)
+
+            if allowDeepFallback and not mediaState['m3u8']:
+                if roundIndex == CAPTURE_DEEP_FALLBACK_AFTER:
+                    print('直接网络抓取暂未命中，启用深度回退抓取（响应体/页面源码）。')
+                self.__consume_page_text(browser, mediaState, seenUrls)
 
             elapsed = int(time.time() - startedAt)
             currentCount = len(mediaState['m3u8'])
@@ -437,7 +474,7 @@ class ChromeCatch:
 
         return bool(current.scheme and current.netloc and current.netloc == target.netloc)
 
-    def __consume_performance_entries(self, browser, mediaState, trackedResponses, seenUrls):
+    def __consume_performance_entries(self, browser, mediaState, trackedResponses, seenUrls, allowResponseBody=False):
         try:
             entries = browser.get_log('performance')
         except Exception:
@@ -485,6 +522,9 @@ class ChromeCatch:
                 requestId = params.get('requestId')
                 responseUrl = trackedResponses.pop(requestId, None)
                 if not requestId or not responseUrl:
+                    continue
+
+                if not allowResponseBody:
                     continue
 
                 if bodyRequestsProcessed >= MAX_RESPONSE_BODIES_PER_PASS:
@@ -686,13 +726,197 @@ class ChromeCatch:
 
         return bool(contentLength and contentLength > RESPONSE_BODY_LIMIT)
 
+    def __collect_search_results(self, browser, pageUrl):
+        seen = {}
+        previousCount = 0
+        stableRounds = 0
+
+        for roundIndex in range(1, SEARCH_SCROLL_MAX_ROUNDS + 1):
+            currentItems = self.__read_search_results(browser, pageUrl)
+            for item in currentItems:
+                url = item.get('url')
+                if not url or url in seen:
+                    continue
+                seen[url] = item
+
+            currentCount = len(seen)
+            print('搜索滚动轮次 {0}: 已识别 {1} 条视频链接。'.format(roundIndex, currentCount))
+
+            if currentCount >= SEARCH_RESULT_LIMIT:
+                break
+
+            if currentCount == previousCount:
+                stableRounds += 1
+            else:
+                stableRounds = 0
+
+            if stableRounds >= SEARCH_SCROLL_STABLE_ROUNDS:
+                break
+
+            previousCount = currentCount
+            self.__scroll_search_page(browser)
+
+        return list(seen.values())[:SEARCH_RESULT_LIMIT]
+
+    def __read_search_results(self, browser, pageUrl):
+        try:
+            items = browser.execute_script(
+                '''
+                const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+                const seen = new Set();
+                const results = [];
+                const moduleRoots = [];
+
+                for (const label of Array.from(document.querySelectorAll('span, div, p, h2, h3'))) {
+                  if (normalizeText(label.textContent) !== '短视频') {
+                    continue;
+                  }
+
+                  const root =
+                    label.closest('section, div[class], div[data-spm], div[data-scm]') ||
+                    label.parentElement;
+                  if (root && !moduleRoots.includes(root)) {
+                    moduleRoots.push(root);
+                  }
+                }
+
+                const fallbackRoots = moduleRoots.length ? moduleRoots : [document];
+                const anchorSelectors = [
+                  '.title_P9gdx a[title]',
+                  'a.titleText_3HLR7[title][data-scm*=".search.rugc.video_"]',
+                  'a[data-spm-anchor-id*="PhoneSokuUgc_"][title]',
+                  'a[title][href*="/video?"][data-scm*=".search.rugc.video_"]'
+                ];
+
+                const anchors = [];
+                for (const root of fallbackRoots) {
+                  for (const selector of anchorSelectors) {
+                    anchors.push(...Array.from(root.querySelectorAll(selector)));
+                  }
+                }
+
+                for (const anchor of anchors) {
+                  let href = anchor.getAttribute("href") || anchor.href || "";
+                  if (!href || /^javascript:/i.test(href)) {
+                    continue;
+                  }
+
+                  if (href.startsWith("//")) {
+                    href = `${location.protocol}${href}`;
+                  } else if (href.startsWith("/")) {
+                    href = new URL(href, location.href).toString();
+                  }
+
+                  if (!/https?:\\/\\/v\\.youku\\.com\\/(?:video|v_show)\\b/i.test(href)) {
+                    continue;
+                  }
+
+                  const scm = String(anchor.getAttribute("data-scm") || "");
+                  const spmAnchorId = String(anchor.getAttribute("data-spm-anchor-id") || "");
+                  const isShortVideoEntry =
+                    /\\.search\\.rugc\\.video_/i.test(scm) ||
+                    /PhoneSokuUgc_/i.test(spmAnchorId);
+                  if (!isShortVideoEntry) {
+                    continue;
+                  }
+
+                  const title =
+                    normalizeText(anchor.getAttribute("title")) ||
+                    normalizeText(anchor.getAttribute("aria-label") || anchor.textContent) ||
+                    normalizeText(anchor.closest("[title]")?.getAttribute("title"));
+
+                  if (!title) {
+                    continue;
+                  }
+
+                  if (seen.has(href)) {
+                    continue;
+                  }
+
+                  seen.add(href);
+                  results.push({ title, url: href });
+                }
+
+                return results;
+                '''
+            ) or []
+        except Exception:
+            items = []
+
+        normalized = []
+        seen = set()
+        for item in items:
+            url = self.__normalize_search_result_url(item.get('url'), pageUrl)
+            if not url or url in seen:
+                continue
+
+            seen.add(url)
+            normalized.append({
+                'title': self.__safe_file_name(item.get('title') or '') or 'youku-video',
+                'url': url,
+            })
+
+        if normalized:
+            return normalized
+
+        try:
+            pageSource = browser.page_source or ''
+        except Exception:
+            pageSource = ''
+
+        matches = re.findall(
+            r'<a[^>]+title="([^"]+)"[^>]+href="((?:https?:)?//v\.youku\.com/(?:video|v_show)[^"]+)"[^>]+data-scm="[^"]*\.search\.rugc\.video_[^"]*"',
+            pageSource,
+            re.I,
+        )
+        results = []
+        for rawTitle, rawUrl in matches:
+            url = self.__normalize_search_result_url(rawUrl, pageUrl)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            results.append({
+                'title': self.__safe_file_name(rawTitle),
+                'url': url,
+            })
+
+        return results
+
+    def __scroll_search_page(self, browser):
+        try:
+            browser.execute_script(
+                '''
+                const step = Math.max(window.innerHeight * 0.9, 900);
+                window.scrollBy(0, step);
+                '''
+            )
+        except Exception:
+            return
+
+        time.sleep(SEARCH_SCROLL_PAUSE)
+
+    def __normalize_search_result_url(self, rawUrl, pageUrl):
+        value = str(rawUrl or '').strip()
+        if not value:
+            return ''
+
+        if value.startswith('//'):
+            value = 'https:{0}'.format(value)
+        elif value.startswith('/'):
+            value = urljoin(pageUrl, value)
+
+        if not re.match(r'^https?://', value, re.I):
+            return ''
+
+        return value
+
     def __safe_file_name(self, value):
         cleaned = re.sub(r'[\/:*?"<>|]', '-', str(value or '').strip())
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned or 'youku-video'
 
     def __getFileM3u8Path(self):
-        return str(PROJECT_ROOT / 'download' / self.__videoGroupName / '{0}_{1}.m3u8'.format(self.__videoIndex, self.__videoName))
+        return str(DOWNLOAD_ROOT / self.__videoGroupName / '{0}_{1}.m3u8'.format(self.__videoIndex, self.__videoName))
 
     def __getFileAssPath(self):
-        return str(PROJECT_ROOT / 'download' / self.__videoGroupName / '{0}_{1}.ass'.format(self.__videoIndex, self.__videoName))
+        return str(DOWNLOAD_ROOT / self.__videoGroupName / '{0}_{1}.ass'.format(self.__videoIndex, self.__videoName))
