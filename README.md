@@ -119,7 +119,7 @@ python3 main.py --group "我的下载-retry" "/绝对路径/failed.csv"
 
 登录态默认会保存在：
 
-- `/Volumes/Lexar E300 Media/dance/.chrome-profile/`
+- `download/.chrome-profile/`
 
 如果你通过 `YOUKU_DOWNLOAD_ROOT` 改过下载目录，登录态也会跟着放到对应根目录下的 `.chrome-profile/`。  
 如果登录态异常，删除这个目录后重新运行即可。
@@ -129,7 +129,7 @@ python3 main.py --group "我的下载-retry" "/绝对路径/failed.csv"
 运行后会生成：
 
 ```text
-/Volumes/Lexar E300 Media/dance/
+download/
   <分组名>/
     video.csv
     failed.csv
@@ -198,8 +198,8 @@ export YOUKU_KEEP_MEDIA_CACHE=0
 
 程序会把失败项导出到：
 
-- `/Volumes/Lexar E300 Media/dance/<分组>/failed.csv`
-- `/Volumes/Lexar E300 Media/dance/<分组>/failed_urls.txt`
+- `download/<分组>/failed.csv`
+- `download/<分组>/failed_urls.txt`
 
 重新跑时直接把 `failed.csv` 当输入即可。
 

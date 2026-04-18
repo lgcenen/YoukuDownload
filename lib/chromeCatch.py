@@ -13,7 +13,7 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 import lib.hls as hls
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOWNLOAD_ROOT = Path('/Volumes/Lexar E300 Media/dance')
+DEFAULT_DOWNLOAD_ROOT = PROJECT_ROOT / 'download'
 DOWNLOAD_ROOT = Path(
     os.getenv('YOUKU_DOWNLOAD_ROOT', str(DEFAULT_DOWNLOAD_ROOT))
 ).expanduser()
