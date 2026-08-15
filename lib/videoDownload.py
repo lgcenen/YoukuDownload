@@ -674,18 +674,10 @@ class VideoDownload:
 
     def __writeConcatManifest(self, playlist, segmentFiles, concatPath):
         lines = ['ffconcat version 1.0']
-        entries = list(playlist.get('segment_entries') or [])
 
-        for index, segmentPath in enumerate(segmentFiles):
+        for segmentPath in segmentFiles:
             absolutePath = segmentPath.resolve().as_posix()
             lines.append("file '{0}'".format(self.__escapeConcatPath(absolutePath)))
-
-            if index >= len(entries) - 1:
-                continue
-
-            duration = entries[index].get('duration')
-            if isinstance(duration, (int, float)) and duration > 0:
-                lines.append('duration {0:.6f}'.format(float(duration)))
 
         concatPath.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 

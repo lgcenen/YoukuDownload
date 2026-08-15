@@ -358,6 +358,19 @@ def parse_media_playlist(text, playlist_url):
 
 
 def is_cycle_restart(previous_entry, current_entry):
+    previous_segment_no = previous_entry.get("segment_no")
+    current_segment_no = current_entry.get("segment_no")
+
+    # Some Youku streams are split into independently timestamped chunks. Their
+    # timestamps restart from zero while ts_seg_no continues to increase, which
+    # is a discontinuity rather than a repeated playlist cycle.
+    if (
+        previous_segment_no is not None
+        and current_segment_no is not None
+        and current_segment_no > previous_segment_no
+    ):
+        return False
+
     previous_start = previous_entry.get("ts_start")
     previous_end = previous_entry.get("ts_end")
     current_start = current_entry.get("ts_start")
@@ -442,6 +455,16 @@ def dedupe_cycle_entries(entries):
                 and current_segment_no < previous_segment_no
             ):
                 dropped += 1
+                continue
+
+            if (
+                previous_segment_no is not None
+                and current_segment_no is not None
+                and current_segment_no > previous_segment_no
+            ):
+                normalized.append(dict(entry))
+                if key:
+                    seen_keys.add(key)
                 continue
 
             previous_start = previous_entry.get("ts_start")
@@ -588,6 +611,16 @@ def analyze_playlist_integrity(playlist):
                 and segment_no < previous_segment_no
             ):
                 report["backward_segment_numbers"] += 1
+
+            is_numbered_continuation = (
+                previous_segment_no is not None
+                and segment_no is not None
+                and segment_no > previous_segment_no
+            )
+
+            if is_numbered_continuation:
+                previous_entry = entry
+                continue
 
             previous_end = previous_entry.get("ts_end")
             current_start = entry.get("ts_start")
