@@ -22,6 +22,7 @@ DEFAULT_USER_AGENT = (
     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
 )
 CHROME_PROFILE_DIR = DOWNLOAD_ROOT / '.chrome-profile'
+CHROME_DEBUGGER_ADDRESS = os.getenv('YOUKU_CHROME_DEBUGGER_ADDRESS', '').strip()
 LOGIN_URL = 'https://account.youku.com/'
 LOGIN_SUCCESS_URL_PREFIX = 'https://www.youku.com/ku/webhome'
 SCAN_LOGIN_TIMEOUT = int(os.getenv('YOUKU_SCAN_TIMEOUT', '180'))
@@ -48,7 +49,6 @@ isLogin = False
 
 def _build_browser(profile_dir=None):
     profilePath = Path(profile_dir or CHROME_PROFILE_DIR)
-    profilePath.mkdir(parents=True, exist_ok=True)
 
     option = webdriver.ChromeOptions()
     option.add_argument('--log-level=3')
@@ -56,11 +56,18 @@ def _build_browser(profile_dir=None):
     option.add_argument('--disable-blink-features=AutomationControlled')
     option.add_argument('--disable-infobars')
     option.add_argument('--disable-quic')
-    option.add_argument(f'--user-data-dir={profilePath}')
-    option.add_experimental_option('excludeSwitches', ['enable-automation'])
-    option.add_experimental_option('useAutomationExtension', False)
     option.page_load_strategy = 'eager'
     option.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+    if CHROME_DEBUGGER_ADDRESS:
+        # Attach to the external Chrome the user logged into instead of opening
+        # a second, isolated browser profile.
+        option.debugger_address = CHROME_DEBUGGER_ADDRESS
+    else:
+        option.add_experimental_option('excludeSwitches', ['enable-automation'])
+        option.add_experimental_option('useAutomationExtension', False)
+        profilePath.mkdir(parents=True, exist_ok=True)
+        option.add_argument(f'--user-data-dir={profilePath}')
 
     chrome_binary = os.getenv('GOOGLE_CHROME_BIN')
     if chrome_binary:
