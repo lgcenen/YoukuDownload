@@ -47,6 +47,10 @@ singleBrowser = None
 isLogin = False
 
 
+class VerificationRequiredError(RuntimeError):
+    """The site requires the user to complete an interactive verification."""
+
+
 def _build_browser(profile_dir=None):
     profilePath = Path(profile_dir or CHROME_PROFILE_DIR)
 
@@ -280,9 +284,11 @@ class ChromeCatch:
         roundIndex = 0
 
         while time.time() - startedAt < CAPTURE_TIMEOUT:
+            self.__raise_if_verification_required(browser, '视频页')
             roundIndex += 1
             self.__try_start_playback(browser)
             time.sleep(1.2)
+            self.__raise_if_verification_required(browser, '视频页')
 
             allowDeepFallback = len(mediaState['m3u8']) == 0 and roundIndex >= CAPTURE_DEEP_FALLBACK_AFTER
 
@@ -349,6 +355,9 @@ class ChromeCatch:
                 self.__navigate_once(browser, url, label, attempt)
                 self.__ensure_page_available(browser, url, label)
                 return
+            except VerificationRequiredError:
+                # Retrying an interactive verification page only increases risk signals.
+                raise
             except RuntimeError as error:
                 errors.append(str(error))
                 if attempt >= OPEN_URL_RETRY_COUNT:
@@ -414,6 +423,8 @@ class ChromeCatch:
         currentUrl = self.__get_current_url(browser)
         pageTitle = self.__get_page_title(browser)
 
+        self.__raise_if_verification_required(browser, label, currentUrl, pageTitle)
+
         if self.__looks_like_browser_error_page(currentUrl, pageTitle):
             raise RuntimeError('{0}仍停留在浏览器错误页：{1}'.format(label, currentUrl or pageTitle or '未知错误'))
 
@@ -422,6 +433,31 @@ class ChromeCatch:
 
         if currentUrl and currentUrl.startswith('data:'):
             raise RuntimeError('{0}打开后落在 data 错误页。'.format(label))
+
+    def __raise_if_verification_required(self, browser, label, currentUrl='', pageTitle=''):
+        currentUrl = currentUrl or self.__get_current_url(browser)
+        pageTitle = pageTitle or self.__get_page_title(browser)
+        path = urlparse(currentUrl).path.lower()
+        title = str(pageTitle or '').strip()
+
+        if '/_____tmd_____/punish' in path or '请验证后继续' in title:
+            raise VerificationRequiredError(
+                '{0}触发优酷人机验证。请在已打开的 Chrome 窗口手动完成验证后再继续；'
+                '程序已停止，未执行自动重试。'.format(label)
+            )
+
+        try:
+            pageText = browser.execute_script(
+                'return (document.body && document.body.innerText) || "";'
+            )
+        except Exception:
+            pageText = ''
+
+        if '为确认您是真人' in str(pageText) and '请按住滑块' in str(pageText):
+            raise VerificationRequiredError(
+                '{0}触发优酷人机验证。请在已打开的 Chrome 窗口手动完成验证后再继续；'
+                '程序已停止，未执行自动重试。'.format(label)
+            )
 
     def __open_new_tab(self, browser):
         try:
